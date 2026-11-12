@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>双人审批 · 公告模式切换</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #182033; --panel2: #1f2a42;
+    --line: #2b3858; --text: #e6ebf5; --muted: #93a0bc;
+    --accent: #5b8def; --green: #3fbf7f; --red: #e56060;
+    --amber: #e0a83d; --purple: #b07fe8;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.6 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header { padding: 18px 26px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  header a { color: var(--accent); font-size: 12px; text-decoration: none; }
+  main { display: grid; grid-template-columns: 420px 1fr; gap: 18px; padding: 18px 26px; }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .panel h2 { font-size: 14px; margin: 0 0 12px; color: var(--accent);
+    text-transform: uppercase; letter-spacing: .06em; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  select, input { width: 100%; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font-size: 13px; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 7px;
+    padding: 7px 12px; font-size: 12px; cursor: pointer; }
+  button.secondary { background: var(--panel2); border: 1px solid var(--line); color: var(--text); }
+  button.warn { background: var(--amber); color: #1a1a1a; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 600; white-space: nowrap; }
+  .pill.pending    { background: rgba(224,168,61,.18); color: var(--amber); }
+  .pill.approved   { background: rgba(91,141,239,.2);  color: var(--accent); }
+  .pill.submitting { background: rgba(176,127,232,.2); color: var(--purple); }
+  .pill.unknown    { background: rgba(229,96,96,.25);  color: var(--red); }
+  .pill.applied    { background: rgba(63,191,127,.18); color: var(--green); }
+  .pill.rejected   { background: rgba(147,160,188,.2); color: var(--muted); }
+  pre { background: #0b1020; border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; overflow: auto; max-height: 300px; font: 12px/1.55 var(--mono); }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line);
+    vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .mono { font-family: var(--mono); }
+  .muted { color: var(--muted); font-size: 12px; }
+  .note { font-size: 12px; color: var(--muted); background: var(--panel2);
+    border-left: 3px solid var(--accent); padding: 8px 10px; border-radius: 0 6px 6px 0;
+    margin-top: 10px; }
+  .banner { display: none; border: 1px solid var(--red); background: rgba(229,96,96,.12);
+    color: var(--red); border-radius: 8px; padding: 10px 12px; font-size: 13px;
+    margin-bottom: 16px; }
+  .banner.show { display: block; }
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 4px 10px; font-size: 12px; }
+  .kv b { color: var(--muted); font-weight: 500; }
+  .actions button { margin: 2px 4px 2px 0; }
+  .flash { font-size: 12px; margin-top: 8px; }
+  .flash.ok { color: var(--green); }
+  .flash.err { color: var(--red); }
+  .flash.wait { color: var(--amber); }
+</style>
+</head>
+<body>
+<header>
+  <h1>双人审批 · 公告公开/个人模式切换</h1>
+  <span class="sub">提案不可修改 · 发起人不能批准 · 一次只提交一笔 · 超时/断流一律待核实</span>
+  <a href="/">← 返回缓存代理演示</a>
+</header>
+
+<main>
+  <div>
+    <section class="panel">
+      <h2>① 当前身份</h2>
+      <div class="kv">
+        <b>已认证账号</b><span class="mono" id="me">…</span>
+        <b>固定运维账号</b><span class="mono" id="accounts">…</span>
+        <b>提交超时</b><span id="submitTimeout">…</span>
+      </div>
+      <div class="note">
+        两个账号由启动配置固定（HTTP Basic）。规则：提案创建后不可修改；
+        发起人不能批准自己的提案，须另一账号复核；批准与提交状态先落库再请求上游。
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>② 上游实际配置（权威）
+        <button class="secondary" style="float:right;margin-top:-4px" id="refreshBtn">刷新</button>
+      </h2>
+      <div class="kv">
+        <b>当前修订</b><span class="mono" id="curRevision">…</span>
+        <b>默认模式</b><span id="curDefault">…</span>
+        <b>按公告覆盖</b><span class="mono" id="curOverrides">…</span>
+        <b>丢回执开关</b><span id="chaosState">…</span>
+      </div>
+      <div class="note">
+        提案携带的"所见修订"即此处的当前修订；提交时若上游修订已前进
+        （他人先生效），上游将按旧修订拒绝。
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>③ 发起提案</h2>
+      <label>公告 ID</label>
+      <select id="pNotice">
+        <option>1</option><option>2</option><option>3</option>
+      </select>
+      <label>目标模式</label>
+      <select id="pTarget">
+        <option value="personal">personal（个人：private,no-store + Set-Cookie）</option>
+        <option value="public">public（公开：可缓存）</option>
+      </select>
+      <label>所见配置修订（自动取上游当前修订）</label>
+      <input id="pRevision" class="mono" readonly />
+      <div class="btns">
+        <button id="createBtn">提交提案（创建后不可修改）</button>
+      </div>
+      <div class="flash" id="createFlash"></div>
+    </section>
+
+    <section class="panel">
+      <h2>④ 上游混沌开关（演练用）</h2>
+      <div class="kv">
+        <b>生效后丢回执</b><span id="chaosSwitchLabel">…</span>
+      </div>
+      <div class="btns">
+        <button class="warn" id="chaosOn">开启：生效后丢回执</button>
+        <button class="secondary" id="chaosOff">关闭</button>
+      </div>
+      <div class="note">
+        开启后：上游照常生效并持久化配置与回执，但<b>不回传回执</b>（沉默至代理超时）。
+        代理必须显示"待核实"——不得报成功或失败，且提交闸关闭、不放行下一笔；
+        用"核实"从上游取回真实回执，或"重试"原提案（同 ID 幂等，不重复生效）。
+      </div>
+    </section>
+  </div>
+
+  <div>
+    <div class="banner" id="gateBanner"></div>
+    <section class="panel">
+      <h2>⑤ 提案列表（发起 / 批准 / 提交 / 核实）</h2>
+      <table id="proposalTable">
+        <thead><tr>
+          <th>提案</th><th>公告</th><th>目标模式</th><th>所见修订</th>
+          <th>发起/批准</th><th>状态</th><th>操作</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="muted" style="margin-top:8px">
+        状态机：待批准 → 已批准 → 提交中 → 已生效/已拒绝；超时/断流 →
+        <b style="color:var(--red)">待核实</b>（既非成功也非失败，须核实或重试）。
+      </div>
+      <pre id="detail" style="display:none"></pre>
+    </section>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let lastState = null;
+let busy = false;
+
+const STATUS_META = {
+  PENDING:    ["待批准", "pending"],
+  APPROVED:   ["已批准·待提交", "approved"],
+  SUBMITTING: ["提交中", "submitting"],
+  UNKNOWN:    ["待核实", "unknown"],
+  APPLIED:    ["已生效", "applied"],
+  REJECTED:   ["已拒绝", "rejected"],
+};
+
+function pill(status) {
+  const [label, cls] = STATUS_META[status] || [status, "rejected"];
+  return `<span class="pill ${cls}">${label}</span>`;
+}
+
+async function api(path, opts = {}) {
+  const resp = await fetch(path, {
+    headers: { "content-type": "application/json" },
+    ...opts,
+  });
+  let data = null;
+  try { data = await resp.json(); } catch (_) {}
+  return { status: resp.status, data };
+}
+
+function fmtTs(ts) {
+  if (!ts) return "—";
+  return new Date(ts * 1000).toLocaleTimeString();
+}
+
+function render(state) {
+  lastState = state;
+  $("me").textContent = state.me;
+  $("accounts").textContent = state.accounts.join(" / ");
+  $("submitTimeout").textContent = state.submit_timeout_seconds + " s";
+
+  // 上游实际配置
+  if (state.upstream.reachable) {
+    const c = state.upstream.config;
+    $("curRevision").textContent = "r" + c.revision;
+    $("curDefault").textContent = c.default_profile;
+    const ov = Object.entries(c.overrides || {});
+    $("curOverrides").textContent =
+      ov.length ? ov.map(([k, v]) => `${k}→${v}`).join("  ") : "（无）";
+    $("chaosState").textContent = c.chaos.drop_receipt
+      ? `开启（生效后沉默 ${c.chaos.drop_seconds}s）` : "关闭";
+    $("chaosSwitchLabel").textContent = c.chaos.drop_receipt ? "当前：开启" : "当前：关闭";
+    $("pRevision").value = c.revision;
+  } else {
+    $("curRevision").textContent = "上游不可达";
+    $("curDefault").textContent = "—";
+    $("curOverrides").textContent = state.upstream.error || "—";
+    $("chaosState").textContent = "—";
+  }
+
+  // 提交闸横幅
+  const banner = $("gateBanner");
+  if (!state.gate.open) {
+    const b = state.gate.blocking;
+    const label = (STATUS_META[b.status] || [b.status])[0];
+    banner.className = "banner show";
+    banner.innerHTML = `提交闸已关闭：提案 <span class="mono">${b.proposal_id.slice(0,8)}</span>
+      处于「${label}」。${b.status === "UNKNOWN"
+        ? "该笔结果未知——不得视为成功或失败；请先「核实」或「重试」，否则不放行下一笔。"
+        : "该笔正在提交中。"}`;
+  } else {
+    banner.className = "banner";
+    banner.innerHTML = "";
+  }
+
+  // 提案表
+  const tb = $("proposalTable").querySelector("tbody");
+  if (!state.proposals.length) {
+    tb.innerHTML = `<tr><td colspan="7" class="muted">（暂无提案）</td></tr>`;
+    return;
+  }
+  tb.innerHTML = state.proposals.map(p => {
+    const mine = p.proposer === state.me;
+    const acts = [];
+    if (p.status === "PENDING") {
+      acts.push(`<button data-act="approve" data-id="${p.proposal_id}"
+        ${mine ? "disabled title=发起人不能批准自己的提案" : ""}>批准</button>`);
+    }
+    if (p.status === "APPROVED") {
+      acts.push(`<button data-act="submit" data-id="${p.proposal_id}"
+        ${state.gate.open ? "" : "disabled title=提交闸已关闭"}>提交</button>`);
+    }
+    if (p.status === "UNKNOWN") {
+      acts.push(`<button class="warn" data-act="verify" data-id="${p.proposal_id}">核实</button>`);
+      acts.push(`<button class="secondary" data-act="retry" data-id="${p.proposal_id}">重试</button>`);
+    }
+    acts.push(`<button class="secondary" data-act="detail" data-id="${p.proposal_id}">详情</button>`);
+    return `<tr>
+      <td class="mono" title="${p.proposal_id}">${p.proposal_id.slice(0,8)}<br>
+        <span class="muted">${fmtTs(p.created_at)}</span></td>
+      <td class="mono">${p.notice_id}</td>
+      <td>${p.target_profile}</td>
+      <td class="mono">r${p.base_revision}</td>
+      <td class="mono">${p.proposer}<br><span class="muted">${p.approver || "—"}</span></td>
+      <td>${pill(p.status)}${p.attempts > 1 ? `<br><span class="muted">尝试×${p.attempts}</span>` : ""}
+        ${p.last_error ? `<br><span class="muted" title="${p.last_error}">⚠ 传输异常</span>` : ""}</td>
+      <td class="actions">${acts.join("")}</td>
+    </tr>`;
+  }).join("");
+}
+
+async function refresh() {
+  try {
+    const { status, data } = await api("/approval/api/state");
+    if (status === 401) { location.reload(); return; }
+    if (data) render(data);
+  } catch (e) { /* 下一轮再试 */ }
+}
+
+function flash(el, cls, msg) {
+  el.className = "flash " + cls;
+  el.textContent = msg;
+}
+
+$("createBtn").onclick = async () => {
+  const body = {
+    notice_id: $("pNotice").value.trim(),
+    target_profile: $("pTarget").value,
+    base_revision: Number($("pRevision").value),
+  };
+  if (!body.notice_id) return flash($("createFlash"), "err", "公告 ID 不能为空");
+  if (!body.base_revision) return flash($("createFlash"), "err", "请先刷新获取上游当前修订");
+  flash($("createFlash"), "wait", "提交中…");
+  const { status, data } = await api("/approval/api/proposals",
+    { method: "POST", body: JSON.stringify(body) });
+  if (status === 201) {
+    flash($("createFlash"), "ok",
+      `提案 ${data.proposal.proposal_id.slice(0,8)} 已创建（不可修改），待另一账号批准。`);
+  } else {
+    flash($("createFlash"), "err", `创建失败：${(data && data.error) || status}`);
+  }
+  await refresh();
+};
+
+async function setChaos(on) {
+  await api("/proxy/upstream/chaos",
+    { method: "POST", body: JSON.stringify({ drop_receipt: on }) });
+  await refresh();
+}
+$("chaosOn").onclick = () => setChaos(true);
+$("chaosOff").onclick = () => setChaos(false);
+$("refreshBtn").onclick = refresh;
+
+$("proposalTable").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn || busy) return;
+  const id = btn.dataset.id;
+  const act = btn.dataset.act;
+  if (act === "detail") {
+    const p = (lastState.proposals || []).find(x => x.proposal_id === id);
+    const el = $("detail");
+    el.style.display = "block";
+    el.textContent = JSON.stringify(p, null, 2);
+    return;
+  }
+  busy = true;
+  btn.disabled = true;
+  const label = { approve: "批准", submit: "提交", verify: "核实", retry: "重试" }[act];
+  btn.textContent = label + "中…";
+  try {
+    const { status, data } = await api(
+      `/approval/api/proposals/${id}/${act}`, { method: "POST" });
+    if (act === "submit" || act === "retry") {
+      const st = data && data.proposal && data.proposal.status;
+      if (status === 202 || st === "UNKNOWN") {
+        alert(`「待核实」：${(data && data.message) || "结果未知"}`);
+      }
+    }
+    if (status >= 400) {
+      alert(`${label}被拒绝：${(data && data.error) || status}`);
+    }
+  } finally {
+    busy = false;
+    await refresh();
+  }
+});
+
+refresh();
+setInterval(() => { if (!busy) refresh(); }, 3000);
+</script>
+</body>
+</html>

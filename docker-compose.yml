@@ -5,9 +5,17 @@ services:
     command: >
       uvicorn proxy.app:app --host 0.0.0.0 --port 8000
     environment:
-      # 上游固定，仅指向本地上游服务
+      # 上游固定，仅指向 compose 内部网络的上游服务
       UPSTREAM_BASE: http://upstream:8001
       UPSTREAM_TIMEOUT_SECONDS: "15"
+      # 双人审批：两个运维账号由启动配置固定（HTTP Basic）
+      OPS_ACCOUNTS: "alice:alice-pass,bob:bob-pass"
+      # 提案提交上游的超时；超时/断流一律判"待核实"
+      APPROVAL_SUBMIT_TIMEOUT_SECONDS: "5"
+      # 代理侧提案 SQLite 持久化（重启后可核实/重试）
+      PROXY_APPROVAL_DB: /data/proxy-approval.db
+    volumes:
+      - proxy-data:/data
     ports:
       - "8000:8000"
     depends_on:
@@ -25,11 +33,21 @@ services:
     image: notice-cache-proxy:latest
     command: >
       uvicorn upstream.app:app --host 0.0.0.0 --port 8001
-    ports:
-      - "8001:8001"
+    environment:
+      # 上游受控配置与回执 SQLite 持久化
+      UPSTREAM_DB: /data/upstream.db
+      # 丢回执时上游沉默时长（须大于代理提交超时）
+      DROP_RECEIPT_SECONDS: "30"
+    volumes:
+      - upstream-data:/data
+    # 注意：上游不暴露任何宿主端口，仅 compose 内部网络可达（经代理访问）
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=3).status==200 else 1)"]
       interval: 5s
       timeout: 3s
       retries: 10
     restart: unless-stopped
+
+volumes:
+  proxy-data:
+  upstream-data:

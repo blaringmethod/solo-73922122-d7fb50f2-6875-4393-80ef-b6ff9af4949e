@@ -1,17 +1,30 @@
 #!/usr/bin/env python3
-"""纯单元测试：Cache-Control 解析、缓存资格判定、CacheStore 代际/合并逻辑。
+"""纯单元测试：Cache-Control 解析、缓存资格判定、CacheStore 代际/合并逻辑，
+以及双人审批两侧 SQLite 存储（上游 ModeStore / 代理 ApprovalStore）。
 
 运行：python3 -I -m unittest scripts.test_units -v
-（不依赖网络与第三方库，cachestore 仅用 stdlib）
+（不依赖网络与第三方库，存储层仅用 stdlib sqlite3）
 """
 
 import asyncio
 import os
 import sys
+import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from proxy.approval_store import (
+    APPROVED,
+    APPLIED,
+    PENDING,
+    REJECTED,
+    SUBMITTING,
+    UNKNOWN,
+    ApprovalError,
+    ApprovalStore,
+)
 from proxy.cachestore import (
     CachedResponse,
     CacheHit,
@@ -20,6 +33,7 @@ from proxy.cachestore import (
     CacheWait,
 )
 from proxy.policy import cache_eligibility, parse_cache_control
+from upstream.mode_store import ModeStore
 
 
 class PolicyParseTests(unittest.TestCase):
@@ -223,6 +237,206 @@ class CacheStoreTests(unittest.TestCase):
                 await leader.inflight.future
 
         self._run(scenario())
+
+
+class ModeStoreTests(unittest.TestCase):
+    """上游受控配置与回执：去重、修订核对、同事务持久化、重启保留。"""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.dir.name, "upstream.db")
+        self.store = ModeStore(self.db)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    @staticmethod
+    def _proposal(pid="p1", notice="1", target="personal", rev=1):
+        return {
+            "proposal_id": pid,
+            "notice_id": notice,
+            "target_profile": target,
+            "base_revision": rev,
+            "proposer": "alice",
+            "approver": "bob",
+        }
+
+    def test_initial_state(self):
+        cur = self.store.current()
+        self.assertEqual(cur["revision"], 1)
+        self.assertEqual(cur["default_profile"], "public")
+        self.assertEqual(cur["overrides"], {})
+
+    def test_apply_bumps_revision_and_persists_receipt(self):
+        receipt, status, deduped = self.store.apply(self._proposal())
+        self.assertEqual((status, deduped), (200, False))
+        self.assertEqual(receipt["outcome"], "applied")
+        self.assertEqual(receipt["new_revision"], 2)
+        cur = self.store.current()
+        self.assertEqual(cur["revision"], 2)
+        self.assertEqual(cur["overrides"], {"1": "personal"})
+        self.assertEqual(self.store.profile_for("1"), "personal")
+        self.assertEqual(self.store.profile_for("2"), "public")
+        # 回执可按提案 ID 核实
+        self.assertEqual(self.store.get_receipt("p1"), receipt)
+
+    def test_retry_same_proposal_returns_original_receipt(self):
+        r1, _, _ = self.store.apply(self._proposal())
+        r2, status2, deduped2 = self.store.apply(self._proposal())
+        self.assertTrue(deduped2)
+        self.assertEqual(status2, 200)
+        self.assertEqual(r1, r2)  # 原回执原样返回
+        self.assertEqual(self.store.current()["revision"], 2)  # 不重复生效
+
+    def test_stale_revision_rejected_and_persisted(self):
+        self.store.apply(self._proposal())  # rev -> 2
+        receipt, status, deduped = self.store.apply(
+            self._proposal(pid="p2", notice="2", rev=1)
+        )
+        self.assertEqual((status, deduped), (409, False))
+        self.assertEqual(receipt["outcome"], "rejected")
+        self.assertEqual(receipt["reason"], "stale_revision")
+        self.assertEqual(self.store.profile_for("2"), "public")  # 未生效
+        # 拒绝回执同样幂等
+        receipt2, status2, deduped2 = self.store.apply(
+            self._proposal(pid="p2", notice="2", rev=1)
+        )
+        self.assertTrue(deduped2)
+        self.assertEqual((status2, receipt2), (409, receipt))
+
+    def test_persistence_across_reopen(self):
+        self.store.apply(self._proposal())
+        reopened = ModeStore(self.db)
+        self.assertEqual(reopened.current()["revision"], 2)
+        self.assertEqual(reopened.profile_for("1"), "personal")
+        self.assertIsNotNone(reopened.get_receipt("p1"))
+
+    def test_invalid_target_profile_rejected(self):
+        with self.assertRaises(ValueError):
+            self.store.apply(self._proposal(target="bogus"))
+
+
+class ApprovalStoreTests(unittest.TestCase):
+    """代理提案状态机：原子批准、提交闸、待核实、重启恢复。"""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.dir.name, "proxy.db")
+        self.store = ApprovalStore(self.db)
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def _create(self, notice="1", target="personal", proposer="alice"):
+        return self.store.create(
+            notice_id=notice, target_profile=target,
+            base_revision=1, proposer=proposer,
+        )
+
+    def test_create_pending_and_immutable_columns(self):
+        p = self._create()
+        self.assertEqual(p["status"], PENDING)
+        self.assertEqual(p["approver"], None)
+        self.assertEqual(p["attempts"], 0)
+        # 存储层不提供任何修改提案内容的方法
+        for name in dir(self.store):
+            self.assertNotIn(name, ("update", "edit", "modify"))
+
+    def test_proposer_cannot_approve(self):
+        p = self._create()
+        with self.assertRaises(ApprovalError) as ctx:
+            self.store.approve(p["proposal_id"], "alice")
+        self.assertEqual(ctx.exception.status_code, 403)
+
+    def test_concurrent_approve_only_one_wins(self):
+        p = self._create()
+        results = {"ok": 0, "conflict": 0}
+
+        def worker():
+            try:
+                self.store.approve(p["proposal_id"], "bob")
+                results["ok"] += 1
+            except ApprovalError:
+                results["conflict"] += 1
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual(results["ok"], 1)
+        self.assertEqual(results["conflict"], 9)
+        self.assertEqual(
+            self.store.get(p["proposal_id"])["status"], APPROVED
+        )
+
+    def test_submit_gate_blocks_next_until_resolved(self):
+        p1 = self._create(notice="1")
+        p2 = self._create(notice="2")
+        self.store.approve(p1["proposal_id"], "bob")
+        self.store.approve(p2["proposal_id"], "bob")
+        self.store.begin_submit(p1["proposal_id"])
+        # 一笔提交中，另一笔不得放行
+        with self.assertRaises(ApprovalError):
+            self.store.begin_submit(p2["proposal_id"])
+        # 待核实同样占闸
+        self.store.mark_unknown(p1["proposal_id"], "timeout")
+        self.assertEqual(self.store.get(p1["proposal_id"])["status"], UNKNOWN)
+        with self.assertRaises(ApprovalError):
+            self.store.begin_submit(p2["proposal_id"])
+        # 核实收敛后闸释放
+        self.store.resolve_from_receipt(
+            p1["proposal_id"], {"outcome": "applied", "new_revision": 2}
+        )
+        self.assertEqual(self.store.get(p1["proposal_id"])["status"], APPLIED)
+        self.store.begin_submit(p2["proposal_id"])
+        self.assertEqual(
+            self.store.get(p2["proposal_id"])["status"], SUBMITTING
+        )
+
+    def test_retry_same_proposal_allowed_from_unknown(self):
+        p = self._create()
+        self.store.approve(p["proposal_id"], "bob")
+        self.store.begin_submit(p["proposal_id"])
+        self.store.mark_unknown(p["proposal_id"], "ReadTimeout")
+        again = self.store.begin_submit(p["proposal_id"])  # 重试原提案
+        self.assertEqual(again["attempts"], 2)
+        self.assertEqual(again["proposal_id"], p["proposal_id"])
+
+    def test_terminal_states_cannot_resubmit(self):
+        p = self._create()
+        self.store.approve(p["proposal_id"], "bob")
+        self.store.begin_submit(p["proposal_id"])
+        self.store.finish_rejected(
+            p["proposal_id"], {"outcome": "rejected", "reason": "stale_revision"}
+        )
+        self.assertEqual(self.store.get(p["proposal_id"])["status"], REJECTED)
+        with self.assertRaises(ApprovalError):
+            self.store.begin_submit(p["proposal_id"])
+
+    def test_restart_recovers_submitting_to_unknown(self):
+        p = self._create()
+        self.store.approve(p["proposal_id"], "bob")
+        self.store.begin_submit(p["proposal_id"])
+        # 模拟进程重启：重新打开同一库
+        reopened = ApprovalStore(self.db)
+        recovered = reopened.recover_after_restart()
+        self.assertEqual(recovered, [p["proposal_id"]])
+        self.assertEqual(
+            reopened.get(p["proposal_id"])["status"], UNKNOWN
+        )
+        # 重启后仍可核实/重试
+        reopened.resolve_from_receipt(
+            p["proposal_id"], {"outcome": "applied", "new_revision": 2}
+        )
+        self.assertEqual(reopened.get(p["proposal_id"])["status"], APPLIED)
+
+    def test_persistence_across_reopen(self):
+        p = self._create()
+        self.store.approve(p["proposal_id"], "bob")
+        reopened = ApprovalStore(self.db)
+        got = reopened.get(p["proposal_id"])
+        self.assertEqual(got["status"], APPROVED)
+        self.assertEqual(got["approver"], "bob")
+        self.assertEqual(got["notice_id"], "1")
 
 
 if __name__ == "__main__":

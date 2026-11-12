@@ -66,6 +66,7 @@
 <header>
   <h1>内网门户公告 · 单进程缓存代理</h1>
   <span class="sub">FastAPI + httpx · 仅代理 <span class="mono">GET /notices/{id}</span> · 缓存键 = 公告 ID + Accept-Language</span>
+  <a href="/approval" style="color:var(--accent);font-size:12px">双人审批（模式切换）→</a>
 </header>
 
 <main>
@@ -126,15 +127,8 @@
     </section>
 
     <section class="panel">
-      <h2>③ 本地上游控制</h2>
+      <h2>③ 本地上游控制（演示旋钮）</h2>
       <div class="row">
-        <div>
-          <label>响应类型</label>
-          <select id="upProfile">
-            <option value="public">public（可缓存公开公告）</option>
-            <option value="personal">personal（Set-Cookie + private,no-store）</option>
-          </select>
-        </div>
         <div>
           <label>失败模式</label>
           <select id="upFailure">
@@ -142,8 +136,6 @@
             <option value="error500">返回 500</option>
           </select>
         </div>
-      </div>
-      <div class="row">
         <div>
           <label>人工延迟（毫秒）</label>
           <input id="upLatency" type="number" value="200" min="0" step="50" />
@@ -156,14 +148,21 @@
       <label>仅对此公告生效（留空 = 全局默认）</label>
       <input id="upScopeNotice" placeholder="例如 1；留空应用到所有公告" />
       <div class="btns">
-        <button id="applyUpstream">应用上游配置</button>
-        <button class="secondary" id="resetUpstream">重置上游与统计</button>
+        <button id="applyUpstream">应用演示旋钮</button>
+        <button class="secondary" id="resetUpstream">重置演示旋钮与统计</button>
       </div>
       <div class="grid2" style="margin-top:10px">
-        <button class="secondary" id="presetPublic">预设：公开可缓存</button>
-        <button class="secondary" id="presetPersonal">预设：个人页面</button>
+        <button class="secondary" id="presetNormal">预设：正常低延迟</button>
         <button class="secondary" id="presetFail">预设：失败 500</button>
         <button class="secondary" id="presetSlow">预设：高延迟 3s</button>
+        <button class="secondary" id="gotoApproval">切换 public/personal →</button>
+      </div>
+      <div class="note">
+        公告的 <b>public / personal 模式</b>属受控配置：本页不再提供直改入口，
+        原 <span class="mono">/admin/config</span>、<span class="mono">/admin/reset</span>
+        也不再接受模式变更（不得绕过审批）。请前往
+        <a href="/approval" style="color:var(--accent)">双人审批页</a>
+        发起提案，由另一运维账号复核后生效。
       </div>
     </section>
   </div>
@@ -317,7 +316,6 @@ async function refreshUpstream() {
 
 async function applyUpstreamConfig(extra) {
   const body = Object.assign({
-    profile: $("upProfile").value,
     failure: $("upFailure").value,
     latency_ms: Number($("upLatency").value),
     max_age: Number($("upMaxAge").value),
@@ -376,7 +374,7 @@ $("purgeBtn").onclick = async () => {
 $("purgeInFlightBtn").onclick = async () => {
   const id = $("purgeId").value.trim() || "1";
   $("noticeId").value = id;
-  await applyUpstreamConfig({ latency_ms: 2500, profile: "public", failure: "none" });
+  await applyUpstreamConfig({ latency_ms: 2500, failure: "none" });
   const lang = $("lang").value;
   const mk = () => fetch(`/notices/${encodeURIComponent(id)}`,
     { headers: lang ? { "Accept-Language": lang } : {} });
@@ -415,7 +413,7 @@ $("applyUpstream").onclick = () => applyUpstreamConfig();
 $("resetUpstream").onclick = async () => {
   await fetch("/proxy/upstream/reset", { method: "POST" });
   await fetch("/proxy/reset", { method: "POST" });
-  $("upProfile").value = "public"; $("upFailure").value = "none";
+  $("upFailure").value = "none";
   $("upLatency").value = 200; $("upMaxAge").value = 30; $("upScopeNotice").value = "";
   await Promise.all([refreshUpstream(), refreshState()]);
 };
@@ -426,14 +424,9 @@ $("proxyResetBtn").onclick = async () => {
   $("respHeaders").textContent = "代际计数保留；缓存与在途单元全部清空。";
   await refreshState();
 };
-const preset = (p) => $("applyUpstream").onclick;
-$("presetPublic").onclick = () => {
-  $("upProfile").value = "public"; $("upFailure").value = "none";
+$("presetNormal").onclick = () => {
+  $("upFailure").value = "none";
   $("upLatency").value = 200; $("upMaxAge").value = 30;
-  return applyUpstreamConfig();
-};
-$("presetPersonal").onclick = () => {
-  $("upProfile").value = "personal";
   return applyUpstreamConfig();
 };
 $("presetFail").onclick = () => {
@@ -444,6 +437,7 @@ $("presetSlow").onclick = () => {
   $("upLatency").value = 3000;
   return applyUpstreamConfig();
 };
+$("gotoApproval").onclick = () => { location.href = "/approval"; };
 $("refreshState").onclick = refreshState;
 $("refreshUpstream").onclick = refreshUpstream;
 

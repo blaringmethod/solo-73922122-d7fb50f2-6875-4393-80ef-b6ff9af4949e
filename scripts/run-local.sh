@@ -23,6 +23,8 @@ wait_healthz() {
 }
 
 echo "starting upstream on :${UPSTREAM_PORT} ..."
+UPSTREAM_DB="$LOG_DIR/upstream.db" \
+DROP_RECEIPT_SECONDS="${DROP_RECEIPT_SECONDS:-30}" \
 PYTHONUNBUFFERED=1 "$PYTHON" -m uvicorn upstream.app:app \
   --host 127.0.0.1 --port "$UPSTREAM_PORT" \
   >"$LOG_DIR/upstream.log" 2>&1 &
@@ -30,7 +32,11 @@ echo $! > "$LOG_DIR/upstream.pid"
 wait_healthz "$UPSTREAM_PORT"
 
 echo "starting proxy on :${PROXY_PORT} (upstream=http://127.0.0.1:${UPSTREAM_PORT}) ..."
-UPSTREAM_BASE="http://127.0.0.1:${UPSTREAM_PORT}" PYTHONUNBUFFERED=1 \
+UPSTREAM_BASE="http://127.0.0.1:${UPSTREAM_PORT}" \
+OPS_ACCOUNTS="${OPS_ACCOUNTS:-alice:alice-pass,bob:bob-pass}" \
+APPROVAL_SUBMIT_TIMEOUT_SECONDS="${APPROVAL_SUBMIT_TIMEOUT_SECONDS:-5}" \
+PROXY_APPROVAL_DB="$LOG_DIR/proxy-approval.db" \
+PYTHONUNBUFFERED=1 \
   "$PYTHON" -m uvicorn proxy.app:app \
   --host 127.0.0.1 --port "$PROXY_PORT" \
   >"$LOG_DIR/proxy.log" 2>&1 &
@@ -40,9 +46,14 @@ wait_healthz "$PROXY_PORT"
 cat <<EOF
 
 服务已启动：
-  演示页（浏览器入口）: http://127.0.0.1:${PROXY_PORT}/
+  缓存代理演示页      : http://127.0.0.1:${PROXY_PORT}/
+  双人审批页（Basic） : http://127.0.0.1:${PROXY_PORT}/approval
+    账号（启动配置固定）: alice:alice-pass / bob:bob-pass
   代理健康检查        : http://127.0.0.1:${PROXY_PORT}/healthz
-  本地上游            : http://127.0.0.1:${UPSTREAM_PORT}/
+  本地上游            : http://127.0.0.1:${UPSTREAM_PORT}/ （仅本机回环）
+持久化（SQLite，重启后可核实/重试）:
+  代理提案库: $LOG_DIR/proxy-approval.db
+  上游配置库: $LOG_DIR/upstream.db
 日志目录: $LOG_DIR
 停止: scripts/stop-local.sh
 EOF
